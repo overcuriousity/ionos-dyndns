@@ -5,13 +5,18 @@
 #
 # Features:
 # - Automatic Zone Discovery
+# - Detailed Verbose Output
 # - Intelligent IP change detection
 # - Bulk Updates
 # - Post-Update Verification
 # - Gotify Notifications (supports self-signed certs)
+# - Error Trapping
 ###############################################################################
 
 set -euo pipefail
+
+# --- TRAP FOR DEBUGGING SILENT FAILURES ---
+trap 'err_line=$LINENO; log ERROR "Script crashed unexpectedly on line ${err_line}"' ERR
 
 # Configuration Paths
 readonly CONFIG_DIR="${HOME}/.config/ionos-dyndns"
@@ -36,9 +41,10 @@ readonly NC='\033[0m' # No Color
 CONFIRM_MODE=false
 FORCE_MODE=false
 
-# Global variables for Gotify (loaded from config)
+# Global variables
 GOTIFY_URL=""
 GOTIFY_TOKEN=""
+PUBLIC_IP=""
 
 ###############################################################################
 # Logging Functions
@@ -81,24 +87,33 @@ send_gotify_notification() {
     local priority="${3:-5}"
 
     if [[ -z "${GOTIFY_URL}" || -z "${GOTIFY_TOKEN}" ]]; then
+        log WARN "Gotify credentials missing. Skipping notification."
         return 0
     fi
 
     log INFO "Sending Gotify notification..."
 
     # Note: -k flag added to allow self-signed certificates
-    local response_code=$(curl -k -s -o /dev/null -w "%{http_code}" \
+    # We capture both stdout and stderr to debug if it fails
+    local response
+    local http_code
+    
+    # Capture http code at the end of the output
+    response=$(curl -k -s -w "\n%{http_code}" \
         --connect-timeout "${CONNECT_TIMEOUT}" \
         -X POST "${GOTIFY_URL}/message?token=${GOTIFY_TOKEN}" \
         -F "title=${title}" \
         -F "message=${message}" \
         -F "priority=${priority}" \
         -F "extras[client::display][contentType]=text/markdown")
-
-    if [[ "${response_code}" -ge 200 && "${response_code}" -lt 300 ]]; then
+    
+    http_code=$(echo "${response}" | tail -n1)
+    
+    if [[ "${http_code}" -ge 200 && "${http_code}" -lt 300 ]]; then
         log SUCCESS "Gotify notification sent."
     else
-        log WARN "Failed to send Gotify notification. HTTP Code: ${response_code}"
+        log WARN "Failed to send Gotify notification. HTTP Code: ${http_code}"
+        log WARN "Response: ${response}"
     fi
 }
 
@@ -140,24 +155,21 @@ setup_config() {
     fi
 
     # 2. Gotify Setup
-    echo -e "\n${YELLOW}--- Gotify Setup (Optional) ---${NC}" >&2
     local configure_gotify=false
     
-    if [[ -f "${GOTIFY_CONFIG_FILE}" && "${force_update}" == "true" ]]; then
-        read -p "Overwrite existing Gotify config? [y/N] " -n 1 -r </dev/tty
+    if [[ "${force_update}" == "true" ]]; then
+        echo -e "\n${YELLOW}--- Gotify Setup (Optional) ---${NC}" >&2
+        read -p "Configure/Update Gotify? [y/N] " -n 1 -r </dev/tty
         echo >&2
         if [[ $REPLY =~ ^[Yy]$ ]]; then configure_gotify=true; fi
     elif [[ ! -f "${GOTIFY_CONFIG_FILE}" ]]; then
-        read -p "Configure Gotify notifications? [y/N] " -n 1 -r </dev/tty
-        echo >&2
-        if [[ $REPLY =~ ^[Yy]$ ]]; then configure_gotify=true; fi
+         true
     fi
 
     if [[ "$configure_gotify" == true ]]; then
         read -p "Gotify URL (e.g. https://push.example.com): " -r g_url </dev/tty
         read -p "Gotify App Token: " -r g_token </dev/tty
         
-        # Remove trailing slash
         g_url=${g_url%/}
 
         cat << EOF > "${GOTIFY_CONFIG_FILE}"
@@ -202,7 +214,7 @@ api_call() {
     local response_file=$(mktemp)
     local http_code
     
-    log INFO "API Call: ${method} ${endpoint}"
+    echo "[$(date '+%H:%M:%S')] [INFO] API Call: ${method} ${endpoint}" >> "${LOG_FILE}"
     
     if [[ -n "${data}" ]]; then
         http_code=$(curl -s -w "%{http_code}" -o "${response_file}" \
@@ -251,7 +263,7 @@ get_public_ip() {
     fi
     
     log SUCCESS "Current IP: ${ip}"
-    echo "${ip}"
+    PUBLIC_IP="${ip}"
 }
 
 fetch_zones() {
@@ -264,44 +276,37 @@ fetch_zones() {
     echo "${zones}"
 }
 
-fetch_zone_records() {
-    local zone_id="$1"
-    local zone_name="$2"
-    local current_ip="$3"
-    
-    local response=$(api_call "GET" "/zones/${zone_id}?recordType=A,AAAA")
-    if [[ -z "${response}" ]]; then return 1; fi
-    
-    local records=$(echo "${response}" | jq -r '.records[] | select(.type == "A") | "\(.name):\(.content)"' 2>/dev/null)
-    if [[ -z "${records}" ]]; then return 0; fi
-    
-    while IFS=: read -r record_name record_ip; do
-        if [[ "${record_ip}" == "${current_ip}" ]]; then
-            echo "${record_name}:${record_ip}:current"
-        else
-            echo -e "  ${YELLOW}⚠${NC} ${record_name} → ${record_ip} ${YELLOW}(needs update)${NC}" >&2
-            echo "${record_name}:${record_ip}:outdated"
-        fi
-    done <<< "${records}"
-}
-
-build_domain_list() {
+process_zone_records() {
     local zones="$1"
     local current_ip="$2"
     local all_domains=()
     local outdated_count=0
     
-    log INFO "Checking records against IP ${current_ip}..."
+    echo "" >&2
+    log INFO "--- Checking Domains ---"
     
     while IFS=: read -r zone_id zone_name; do
-        local records=$(fetch_zone_records "${zone_id}" "${zone_name}" "${current_ip}")
-        if [[ -n "${records}" ]]; then
-            while IFS=: read -r record_name record_ip status; do
+        local response=$(api_call "GET" "/zones/${zone_id}?recordType=A,AAAA")
+        
+        if [[ -n "${response}" ]]; then
+            local records=$(echo "${response}" | jq -r '.records[] | select(.type == "A") | "\(.name):\(.content)"' 2>/dev/null)
+            
+            if [[ -z "${records}" ]]; then continue; fi
+
+            while IFS=: read -r record_name record_ip; do
+                if [[ "${record_ip}" != "${current_ip}" ]]; then
+                    ((outdated_count+=1))
+                    echo -e "  ${YELLOW}[UPDATE NEEDED]${NC} ${record_name} (${record_ip} -> ${current_ip})" >&2
+                else
+                    echo -e "  ${GREEN}[OK]${NC} ${record_name} (${record_ip})" >&2
+                fi
+                
                 all_domains+=("${record_name}")
-                if [[ "${status}" == "outdated" ]]; then ((outdated_count++)); fi
             done <<< "${records}"
         fi
     done <<< "${zones}"
+    
+    echo "" >&2
     
     printf '%s\n' "${all_domains[@]}" | sort -u
     echo "OUTDATED_COUNT:${outdated_count}"
@@ -352,27 +357,27 @@ verify_updates() {
     local zones="$1"
     local expected_ip="$2"
     
-    log INFO "================================================"
-    log INFO "VERIFYING DNS UPDATES"
-    log INFO "================================================"
+    log INFO "--- Verifying Updates ---"
     
     local total_matched=0
     local total_mismatched=0
     
     while IFS=: read -r zone_id zone_name; do
-        log INFO "Checking zone: ${zone_name}"
         local response=$(api_call "GET" "/zones/${zone_id}?recordType=A,AAAA")
         
         if [[ -n "${response}" ]]; then
             local records=$(echo "${response}" | jq -r '.records[] | select(.type == "A") | "\(.name):\(.content)"' 2>/dev/null)
             
+            if [[ -z "${records}" ]]; then continue; fi
+
             while IFS=: read -r record_name record_ip; do
                 if [[ "${record_ip}" == "${expected_ip}" ]]; then
                     echo -e "  ${GREEN}✓${NC} ${record_name} → ${record_ip}" >&2
-                    ((total_matched++))
+                    # FIX: Use +=1 instead of ++ to avoid exit on 0 with set -e
+                    ((total_matched+=1))
                 else
                     echo -e "  ${RED}✗${NC} ${record_name} → ${record_ip} ${YELLOW}(Expected: ${expected_ip})${NC}" >&2
-                    ((total_mismatched++))
+                    ((total_mismatched+=1))
                 fi
             done <<< "${records}"
         fi
@@ -424,18 +429,18 @@ main() {
     load_gotify_config
     
     # 1. Get IP
-    public_ip=$(get_public_ip)
+    get_public_ip
     
     # 2. Get Zones
     zones=$(fetch_zones)
     
-    # 3. Check Status
-    result=$(build_domain_list "${zones}" "${public_ip}")
-    domains=$(echo "${result}" | grep -v "^OUTDATED_COUNT:")
-    outdated_count=$(echo "${result}" | grep "^OUTDATED_COUNT:" | cut -d: -f2)
-    domain_count=$(echo "${domains}" | wc -l)
+    # 3. Check Status (And Print Verbose Output)
+    result=$(process_zone_records "${zones}" "${PUBLIC_IP}")
     
-    if [[ -z "${domains}" ]]; then log INFO "No domains found."; exit 0; fi
+    domains_list=$(echo "${result}" | grep -v "^OUTDATED_COUNT:")
+    outdated_count=$(echo "${result}" | grep "^OUTDATED_COUNT:" | cut -d: -f2)
+    
+    if [[ -z "${domains_list}" ]]; then log INFO "No domains found."; exit 0; fi
     
     # 4. Decision
     if [[ "${outdated_count}" -eq 0 && "${FORCE_MODE}" != true ]]; then
@@ -450,22 +455,29 @@ main() {
     fi
     
     # 5. Update
-    update_url=$(create_dyndns_bulk "${domains}")
+    update_url=$(create_dyndns_bulk "${domains_list}")
     
     if trigger_update "${update_url}"; then
         log INFO "Waiting 5s for propagation..."
         sleep 5
         
         # 6. Verify
-        verify_updates "${zones}" "${public_ip}"
+        verify_updates "${zones}" "${PUBLIC_IP}"
         
         # 7. Notify
         if [[ -n "${GOTIFY_URL}" && -n "${GOTIFY_TOKEN}" ]]; then
-            msg_body="**New IP:** \`${public_ip}\`  "
-            msg_body+=$'\n'"**Domains:** ${domain_count}  "
+            # Format domain list for markdown (bullet points)
+            formatted_domains=$(echo "${domains_list}" | sed 's/^/* /')
+            domain_count=$(echo "${domains_list}" | wc -l)
+            
+            msg_body="**New IP:** \`${PUBLIC_IP}\`  "
             msg_body+=$'\n'"**Mode:** $([[ "${FORCE_MODE}" == true ]] && echo "Forced" || echo "Automatic")"
+            msg_body+=$'\n'"**Updated Domains:** ${domain_count}"
+            msg_body+=$'\n'"${formatted_domains}"
             
             send_gotify_notification "IONOS DNS Update Success" "${msg_body}" 5
+        else
+            log WARN "Gotify not configured (URL or Token missing). Notification skipped."
         fi
     else
         error_exit "Update trigger failed."
